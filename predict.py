@@ -1,11 +1,22 @@
 import torch
 import torch.nn.functional as F
-
 from model import LSTMAutocomplete
 
-# =============================
+# -----------------------
+# Configuration
+# -----------------------
+CHECKPOINT_PATH = "checkpoints/lstm_autocomplete.pt"
+VOCAB_PATH = "checkpoints/vocab.pt"
+
+SEQ_LEN = 20
+TEMPERATURE = 0.8
+TOP_K = 40
+REPETITION_PENALTY = 1.2
+MAX_GENERATE = 50
+
+# -----------------------
 # Device
-# =============================
+# -----------------------
 if torch.backends.mps.is_available():
     device = torch.device("mps")
 elif torch.cuda.is_available():
@@ -13,91 +24,95 @@ elif torch.cuda.is_available():
 else:
     device = torch.device("cpu")
 
-print("Using device:", device)
+print(f"Using device: {device}")
 
-# =============================
-# Paths
-# =============================
-MODEL_PATH = "checkpoints/lstm_autocomplete.pt"
-VOCAB_PATH = "checkpoints/vocab.pt"
-
-# =============================
+# -----------------------
 # Load vocab
-# =============================
-vocab_data = torch.load(VOCAB_PATH, map_location="cpu")
+# -----------------------
+vocab_data = torch.load(VOCAB_PATH)
 word_to_idx = vocab_data["word_to_idx"]
 idx_to_word = vocab_data["idx_to_word"]
 
 vocab_size = len(word_to_idx)
-print("Vocab size:", vocab_size)
 
-# =============================
+# -----------------------
 # Load model
-# =============================
+# -----------------------
 model = LSTMAutocomplete(vocab_size=vocab_size)
-checkpoint = torch.load(MODEL_PATH, map_location=device)
+checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
 model.load_state_dict(checkpoint["model_state"])
 model.to(device)
 model.eval()
 
 print("Model loaded from checkpoint")
 
-# =============================
-# Helpers
-# =============================
-def encode_words(words):
-    unk = word_to_idx["<unk>"]
-    return [word_to_idx.get(w, unk) for w in words]
+# -----------------------
+# Sampling helpers
+# -----------------------
+def apply_repetition_penalty(logits, recent_tokens, penalty):
+    for t in set(recent_tokens):
+        logits[0, t] /= penalty
+    return logits
 
-def decode_words(indices):
-    return [idx_to_word[i] for i in indices]
 
-# =============================
-# Predict next word
-# =============================
-@torch.no_grad()
-def predict_next(words, temperature=1.0, top_k=20):
-    """
-    words: list[str]
-    """
-    x = torch.tensor(encode_words(words), dtype=torch.long).unsqueeze(0).to(device)
+def top_k_filter(logits, k):
+    if k <= 0:
+        return logits
+    values, _ = torch.topk(logits, k)
+    min_val = values[:, -1].unsqueeze(1)
+    return torch.where(logits < min_val, torch.full_like(logits, -1e10), logits)
 
-    logits, _ = model(x)
-    logits = logits.squeeze(0) / temperature
 
-    if top_k is not None:
-        values, indices = torch.topk(logits, top_k)
-        probs = torch.zeros_like(logits)
-        probs[indices] = F.softmax(values, dim=0)
-    else:
-        probs = F.softmax(logits, dim=0)
+def sample_next(logits, recent_tokens):
+    logits = logits / TEMPERATURE
+    logits = apply_repetition_penalty(logits, recent_tokens, REPETITION_PENALTY)
+    logits = top_k_filter(logits, TOP_K)
 
-    next_idx = torch.multinomial(probs, 1).item()
-    return idx_to_word[next_idx]
+    probs = F.softmax(logits, dim=-1)
+    next_token = torch.multinomial(probs, 1).item()
+    return next_token
 
-# =============================
-# Generate text
-# =============================
-def generate(prompt, max_words=50, temperature=1.0):
-    words = prompt.lower().split()
 
-    for _ in range(max_words):
-        next_word = predict_next(words, temperature=temperature)
-        words.append(next_word)
+# -----------------------
+# Generation loop
+# -----------------------
+def generate(prompt):
+    tokens = prompt.lower().split()
+    encoded = [word_to_idx.get(w, word_to_idx["<unk>"]) for w in tokens]
 
-        if next_word == "<eos>":
-            break
+    generated = encoded[:]
 
+    with torch.no_grad():
+        hidden = None
+
+        for _ in range(MAX_GENERATE):
+            context = generated[-SEQ_LEN:]
+            x = torch.tensor(context, dtype=torch.long).unsqueeze(0).to(device)
+
+            logits, hidden = model(x, hidden)
+            next_token = sample_next(logits, generated[-10:])
+
+            generated.append(next_token)
+
+            if idx_to_word[next_token] == "<eos>":
+                break
+
+    words = [idx_to_word[i] for i in generated]
     return " ".join(words)
 
-# =============================
-# Interactive mode
-# =============================
-if __name__ == "__main__":
-    print("\nType a prompt (or Ctrl+C to quit)\n")
 
-    while True:
-        prompt = input(">> ")
-        out = generate(prompt, max_words=50, temperature=0.9)
-        print(out)
+# -----------------------
+# Interactive prompt
+# -----------------------
+print("\nType a prompt (or Ctrl+C to quit)\n")
+
+while True:
+    try:
+        prompt = input(">> ").strip()
+        if not prompt:
+            continue
+        print(generate(prompt))
         print()
+    except KeyboardInterrupt:
+        print("\nBye 👋")
+        break
